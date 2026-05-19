@@ -1,4 +1,4 @@
-name: KMA Downloader Pro
+name: KMA Downloader Pro with Tor
 
 on:
   workflow_dispatch:
@@ -12,36 +12,17 @@ on:
         required: false
         type: string
         default: 'downloads'
-      quality:
-        description: 'کیفیت'
-        required: false
-        type: choice
-        default: 'best'
-        options:
-          - 'best'
-          - 'bestvideo[height<=720]+bestaudio'
-          - 'bestvideo[height<=1080]+bestaudio'
-      use_proxy:
-        description: 'استفاده از پروکسی'
-        required: false
-        type: boolean
-        default: true
       adult_content:
         description: 'محتوای بزرگسالان'
         required: false
         type: boolean
         default: false
-      max_size_mb:
-        description: 'حداکثر حجم هر فایل (MB)'
-        required: false
-        type: number
-        default: 95
 
 permissions:
   contents: write
 
 jobs:
-  download:
+  download-with-tor:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -54,126 +35,72 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install tools
+      - name: Install yt-dlp and Tor
         run: |
-          pip install yt-dlp
+          pip install -U yt-dlp
           sudo apt-get update
-          sudo apt-get install -y rar
+          sudo apt-get install -y tor rar
+          sudo service tor start
+          # صبر برای راه‌اندازی کامل Tor
+          sleep 10
 
       - name: Prepare folder
         run: |
-          if [ "$ADULT_CONTENT" = "true" ]; then
-            FOLDER="adult_$OUTPUT_FOLDER"
+          if [ "${{ github.event.inputs.adult_content }}" = "true" ]; then
+            FOLDER="adult_${{ github.event.inputs.output_folder }}"
           else
-            FOLDER="$OUTPUT_FOLDER"
+            FOLDER="${{ github.event.inputs.output_folder }}"
           fi
           mkdir -p "$FOLDER"
           echo "FOLDER=$FOLDER" >> $GITHUB_ENV
           date > timestamp.txt
-        env:
-          OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
-          ADULT_CONTENT: ${{ github.event.inputs.adult_content }}
 
-      - name: Download video
+      - name: Download via Tor
         id: download
         run: |
           FOLDER="${{ env.FOLDER }}"
           URL="${{ github.event.inputs.url }}"
-          QUALITY="${{ github.event.inputs.quality }}"
           
-          echo "Downloading from: $URL"
-          echo "Saving to: $FOLDER"
+          echo "Downloading via Tor from: $URL"
           
-          DOWNLOAD_SUCCESS=false
+          # بررسی وضعیت Tor
+          curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip -s | grep -q "IsTor" && echo "✅ Tor is working" || echo "⚠️ Tor check failed"
           
-          # روش اول: دانلود معمولی
-          if yt-dlp \
+          # دانلود با پروکسی Tor
+          yt-dlp \
+            --proxy "socks5://127.0.0.1:9050" \
             --output "$FOLDER/%(title)s.%(ext)s" \
-            --format "$QUALITY" \
+            --format "best[ext=mp4]/best" \
             --merge-output-format mp4 \
-            --retries 5 \
+            --retries 10 \
+            --fragment-retries 10 \
             --no-check-certificate \
-            --geo-bypass \
             --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            "$URL"; then
-            DOWNLOAD_SUCCESS=true
-            echo "Download successful with normal method"
-          fi
-          
-          # روش دوم: با پروکسی
-          if [ "$DOWNLOAD_SUCCESS" = "false" ] && [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
-            echo "Trying with proxy..."
-            if yt-dlp \
-              --output "$FOLDER/%(title)s.%(ext)s" \
-              --format "$QUALITY" \
-              --merge-output-format mp4 \
-              --retries 10 \
-              --proxy "http://us.proxy.webshare.io:80" \
-              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
-              --no-check-certificate \
-              "$URL"; then
-              DOWNLOAD_SUCCESS=true
-              echo "Download successful with proxy"
-            fi
-          fi
-          
-          # روش سوم: با هدرهای بیشتر
-          if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
-            echo "Trying with additional headers..."
-            if yt-dlp \
-              --output "$FOLDER/%(title)s.%(ext)s" \
-              --format "$QUALITY" \
-              --merge-output-format mp4 \
-              --retries 10 \
-              --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-              --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-              --add-header "Accept-Language:en-US,en;q=0.5" \
-              --add-header "Referer:https://www.google.com/" \
-              --no-check-certificate \
-              "$URL"; then
-              DOWNLOAD_SUCCESS=true
-              echo "Download successful with headers"
-            fi
-          fi
-          
-          if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
-            echo "All download methods failed!"
-            exit 1
-          fi
+            --add-header "Accept-Language: en-US,en;q=0.9" \
+            "$URL"
           
           # پیدا کردن فایل دانلود شده
-          sleep 2
           DOWNLOADED_FILE=$(find "$FOLDER" -type f -newer timestamp.txt ! -name "timestamp.txt" 2>/dev/null | head -1)
           
           if [ -n "$DOWNLOADED_FILE" ]; then
             echo "file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
-            SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || stat -f%z "$DOWNLOADED_FILE" 2>/dev/null)
-            echo "size=$SIZE" >> $GITHUB_OUTPUT
-            echo "✅ Downloaded: $DOWNLOADED_FILE"
+            echo "✅ Downloaded via Tor: $DOWNLOADED_FILE"
           else
-            echo "Warning: Could not find downloaded file, but continuing..."
+            echo "⚠️ Download may have failed"
           fi
 
       - name: Split if needed
         if: steps.download.outputs.file != ''
         run: |
           FILE="${{ steps.download.outputs.file }}"
-          SIZE="${{ steps.download.outputs.size }}"
-          THRESHOLD="${{ github.event.inputs.max_size_mb }}"
-          
-          if [ -n "$SIZE" ] && [ -n "$THRESHOLD" ]; then
-            SIZE_MB=$(echo "$SIZE / 1048576" | bc)
-            
-            if [ "$SIZE_MB" -gt "$THRESHOLD" ]; then
-              echo "File is ${SIZE_MB}MB, splitting into ${THRESHOLD}MB parts..."
+          if [ -f "$FILE" ]; then
+            SIZE=$(stat -c%s "$FILE")
+            SIZE_MB=$((SIZE / 1048576))
+            if [ $SIZE_MB -gt 95 ]; then
               cd "$(dirname "$FILE")"
-              BASENAME=$(basename "$FILE")
               RAND_NAME=$(openssl rand -hex 3)
-              rar a -v${THRESHOLD}m -m5 "${RAND_NAME}.rar" "$BASENAME"
-              rm "$BASENAME"
-              echo "✅ Split complete"
-            else
-              echo "File size ${SIZE_MB}MB is under threshold ${THRESHOLD}MB, no split needed"
+              rar a -v95m -m5 "${RAND_NAME}.rar" "$(basename "$FILE")"
+              rm "$(basename "$FILE")"
             fi
           fi
 
@@ -182,5 +109,5 @@ jobs:
           git config user.name "KMA Bot"
           git config user.email "bot@kma.local"
           git add .
-          git commit -m "Download: ${{ github.event.inputs.url }}" || echo "Nothing to commit"
+          git commit -m "Download via Tor: ${{ github.event.inputs.url }}" || echo "Nothing to commit"
           git push || echo "Nothing to push"
