@@ -1,0 +1,181 @@
+name: KMA Downloader Pro
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: '🔗 لینک ویدیو یا فایل'
+        required: true
+        type: string
+      output_folder:
+        description: '📁 پوشه ذخیره (پیش‌فرض: downloads)'
+        required: false
+        type: string
+        default: 'downloads'
+      quality:
+        description: '🎬 کیفیت (best, 720p, 1080p, bestaudio)'
+        required: false
+        type: choice
+        default: 'best'
+        options:
+          - 'best'
+          - 'bestvideo[height<=720]+bestaudio'
+          - 'bestvideo[height<=1080]+bestaudio'
+          - 'worst'
+          - 'bestaudio'
+      use_proxy:
+        description: '🛡️ استفاده از پروکسی؟ (برای دور زدن 410)'
+        required: false
+        type: boolean
+        default: true
+      adult_content:
+        description: '🔞 محتوای بزرگسالان؟'
+        required: false
+        type: boolean
+        default: false
+      max_size_mb:
+        description: '💾 حداکثر حجم هر فایل (MB) - برای اسپلیت'
+        required: false
+        type: number
+        default: 95
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: 1
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  download-and-process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    
+    steps:
+      - name: 🔄 Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          
+      - name: 📦 Install dependencies
+        run: |
+          pip install -U yt-dlp requests
+          sudo apt-get update
+          sudo apt-get install -y rar unrar bc curl wget jq openssl
+          
+      - name: 🌍 Setup proxy (if enabled)
+        if: inputs.use_proxy == true
+        run: |
+          # لیست پروکسی‌های رایگان و نسبتاً پایدار
+          PROXY_LIST=(
+            "http://proxy.scraperapi.com:8001"
+            "http://us.proxy.webshare.io:80"
+            "socks5://184.178.172.5:4145"
+          )
+          # انتخاب رندوم
+          RANDOM_PROXY=${PROXY_LIST[$RANDOM % ${#PROXY_LIST[@]}]}
+          echo "PROXY=$RANDOM_PROXY" >> $GITHUB_ENV
+          echo "Using proxy: $RANDOM_PROXY"
+          
+      - name: 🔍 Check URL status (diagnostic)
+        id: check_url
+        run: |
+          chmod +x scripts/check_url.sh
+          ./scripts/check_url.sh "${{ github.event.inputs.url }}"
+          
+      - name: 📥 Download file with intelligent retry
+        id: download
+        run: |
+          chmod +x scripts/download_with_retry.sh
+          
+          # آماده‌سازی متغیرها
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          if [ "${{ inputs.adult_content }}" = "true" ]; then
+            FOLDER="adult_${FOLDER}"
+            echo "⚠️ Adult content mode enabled"
+          fi
+          
+          mkdir -p "$FOLDER"
+          
+          export DOWNLOAD_URL="${{ github.event.inputs.url }}"
+          export OUTPUT_FOLDER="$FOLDER"
+          export QUALITY="${{ github.event.inputs.quality }}"
+          export USE_PROXY="${{ inputs.use_proxy }}"
+          
+          ./scripts/download_with_retry.sh
+          
+          # ذخیره اطلاعات فایل دانلود شده
+          LATEST_FILE=$(find "$FOLDER" -type f -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" | head -1)
+          if [ -n "$LATEST_FILE" ]; then
+            echo "downloaded_file=$LATEST_FILE" >> $GITHUB_OUTPUT
+            FILE_SIZE=$(stat -c%s "$LATEST_FILE")
+            echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+          fi
+        env:
+          HTTP_PROXY: ${{ env.PROXY }}
+          HTTPS_PROXY: ${{ env.PROXY }}
+          
+      - name: ✂️ Smart split if needed
+        if: steps.download.outputs.downloaded_file != ''
+        run: |
+          chmod +x scripts/smart_split.sh
+          FILE_SIZE_MB=$(echo "scale=2; ${{ steps.download.outputs.file_size }} / 1048576" | bc)
+          THRESHOLD_MB=${{ inputs.max_size_mb }}
+          
+          if (( $(echo "$FILE_SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
+            echo "File size ($FILE_SIZE_MB MB) exceeds threshold ($THRESHOLD_MB MB). Splitting..."
+            ./scripts/smart_split.sh "${{ steps.download.outputs.downloaded_file }}" $THRESHOLD_MB
+          else
+            echo "File size ($FILE_SIZE_MB MB) is OK. No split needed."
+          fi
+          
+      - name: 🔒 Protect adult content
+        if: inputs.adult_content == true
+        run: |
+          FOLDER="${{ github.event.inputs.output_folder }}"
+          ADULT_FOLDER="adult_${FOLDER}"
+          
+          if [ -d "$ADULT_FOLDER" ]; then
+            # ایجاد فایل .gitkeep و .adult-protect برای علامت‌گذاری
+            echo "This folder contains adult content - Access restricted" > "$ADULT_FOLDER/.adult-protect"
+            echo "*.rar filter=git-crypt" > "$ADULT_FOLDER/.gitattributes"
+            
+            # تغییر permission در git
+            git update-index --skip-worktree "$ADULT_FOLDER/.adult-protect" 2>/dev/null || true
+          fi
+          
+      - name: 💾 Commit and push to repository
+        run: |
+          git config user.name "KMA Downloader Bot"
+          git config user.email "kma-downloader@github.com"
+          
+          # فقط فایل‌های جدید رو اضافه کن
+          git add -A
+          
+          # اگه تغییری بود کامیت کن
+          if ! git diff --cached --quiet; then
+            git commit -m "📥 Downloaded: ${{ github.event.inputs.url }}" -m "Quality: ${{ github.event.inputs.quality }}" -m "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            git push origin HEAD:main --force
+            echo "✅ Changes committed and pushed"
+          else
+            echo "ℹ️ No new files to commit"
+          fi
+          
+      - name: 📊 Summary
+        run: |
+          echo "## 🚀 Download Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **URL:** ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Quality:** ${{ github.event.inputs.quality }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Adult Content:** ${{ inputs.adult_content }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Proxy Used:** ${{ inputs.use_proxy }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ✅ Completed" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -n "${{ steps.download.outputs.file_size }}" ]; then
+            SIZE_MB=$(echo "scale=2; ${{ steps.download.outputs.file_size }} / 1048576" | bc)
+            echo "- **File Size:** ${SIZE_MB} MB" >> $GITHUB_STEP_SUMMARY
+          fi
