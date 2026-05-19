@@ -1,10 +1,10 @@
-name: p
+name: Downloader
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: 'URL of the video'
+        description: "Video URL"
         required: true
         type: string
 
@@ -22,33 +22,81 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install packages
         run: |
           python -m pip install --upgrade pip
           pip install -U yt-dlp
+          sudo apt-get update
+          sudo apt-get install -y rar jq
 
-      - name: Download
+      - name: Create folders
         run: |
           mkdir -p downloads
+          mkdir -p split
 
+      - name: Download video
+        id: download
+        shell: bash
+        run: |
           yt-dlp \
-            --cookies-from-browser chrome \
             --no-check-certificates \
             --geo-bypass \
             --force-ipv4 \
             --retries 10 \
             --fragment-retries 10 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36" \
             -f "bv*[height<=720]+ba/b" \
+            --merge-output-format mp4 \
             -o "downloads/%(title)s.%(ext)s" \
             "${{ github.event.inputs.url }}"
 
-      - name: Push files
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          FILE=$(find downloads -type f | head -n 1)
 
-          git add downloads/
-          git commit -m "upload" || exit 0
-          git push
+          if [ ! -f "$FILE" ]; then
+            echo "Download failed"
+            exit 1
+          fi
+
+          echo "file=$FILE" >> $GITHUB_OUTPUT
+
+      - name: Split if bigger than 95MB
+        id: split
+        shell: bash
+        run: |
+          FILE="${{ steps.download.outputs.file }}"
+          SIZE=$(stat -c%s "$FILE")
+
+          LIMIT=$((95 * 1024 * 1024))
+
+          BASENAME=$(basename "$FILE")
+
+          if [ "$SIZE" -gt "$LIMIT" ]; then
+
+            cd downloads
+
+            rar a -v95m "../split/${BASENAME}.rar" "$BASENAME"
+
+            echo "split=true" >> $GITHUB_OUTPUT
+
+          else
+
+            cp "$FILE" split/
+
+            echo "split=false" >> $GITHUB_OUTPUT
+
+          fi
+
+      - name: Generate tag
+        id: tag
+        run: |
+          TAG="release-$(date +%s)"
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Downloaded Video
+          files: split/*
