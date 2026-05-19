@@ -60,7 +60,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # خط cache رو حذف کردم تا خطا نده
           
       - name: 📦 Install dependencies
         run: |
@@ -68,105 +68,290 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y rar unrar bc curl wget jq openssl
           
-      - name: 🌍 Setup proxy (if enabled)
-        if: inputs.use_proxy == true
+      - name: 📁 Create scripts directory if not exists
         run: |
-          # لیست پروکسی‌های رایگان و نسبتاً پایدار
-          PROXY_LIST=(
-            "http://proxy.scraperapi.com:8001"
-            "http://us.proxy.webshare.io:80"
-            "socks5://184.178.172.5:4145"
-          )
-          # انتخاب رندوم
-          RANDOM_PROXY=${PROXY_LIST[$RANDOM % ${#PROXY_LIST[@]}]}
-          echo "PROXY=$RANDOM_PROXY" >> $GITHUB_ENV
-          echo "Using proxy: $RANDOM_PROXY"
+          mkdir -p scripts
+          mkdir -p config
           
-      - name: 🔍 Check URL status (diagnostic)
-        id: check_url
+      - name: 📝 Create check_url.sh script
         run: |
+          cat > scripts/check_url.sh << 'EOF'
+#!/bin/bash
+
+URL=$1
+
+echo "========================================="
+echo "🔍 Checking URL: $URL"
+echo "========================================="
+
+# تست با روش‌های مختلف
+METHODS=("default" "proxy" "tor")
+
+for METHOD in "${METHODS[@]}"; do
+    echo ""
+    echo "Testing with $METHOD method..."
+    
+    if [ "$METHOD" = "default" ]; then
+        STATUS=$(curl -L -o /dev/null -s -w "%{http_code}" \
+            --max-time 30 \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "$URL")
+    elif [ "$METHOD" = "proxy" ]; then
+        STATUS=$(curl -L -o /dev/null -s -w "%{http_code}" \
+            --max-time 30 \
+            --proxy http://us.proxy.webshare.io:80 \
+            "$URL")
+    else
+        STATUS=$(curl -L -o /dev/null -s -w "%{http_code}" \
+            --max-time 30 \
+            -x socks5://184.178.172.5:4145 \
+            "$URL")
+    fi
+    
+    echo "HTTP Status: $STATUS"
+    
+    if [ "$STATUS" = "200" ]; then
+        echo "✅ URL is accessible with $METHOD method"
+        exit 0
+    elif [ "$STATUS" = "410" ]; then
+        echo "❌ HTTP 410 Gone - Resource permanently removed"
+        exit 1
+    fi
+done
+
+exit 1
+EOF
           chmod +x scripts/check_url.sh
-          ./scripts/check_url.sh "${{ github.event.inputs.url }}"
           
-      - name: 📥 Download file with intelligent retry
-        id: download
+      - name: 📝 Create download_with_retry.sh script
         run: |
+          cat > scripts/download_with_retry.sh << 'EOF'
+#!/bin/bash
+
+URL="${DOWNLOAD_URL}"
+FOLDER="${OUTPUT_FOLDER:-downloads}"
+QUALITY="${QUALITY:-best}"
+USE_PROXY="${USE_PROXY:-false}"
+
+mkdir -p "$FOLDER"
+touch "$FOLDER/.download_start"
+
+echo "========================================="
+echo "📥 Starting download process"
+echo "URL: $URL"
+echo "Folder: $FOLDER"
+echo "Quality: $QUALITY"
+echo "Proxy: $USE_PROXY"
+echo "========================================="
+
+# روش‌های مختلف دانلود
+METHODS=(
+    "yt-dlp_normal"
+    "yt-dlp_with_headers"
+    "yt-dlp_with_user_agent"
+    "curl_fallback"
+)
+
+if [ "$USE_PROXY" = "true" ]; then
+    METHODS+=("yt-dlp_with_proxy")
+fi
+
+RETRY_COUNT=0
+MAX_RETRIES=${#METHODS[@]}
+SUCCESS=false
+
+for METHOD in "${METHODS[@]}"; do
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    echo ""
+    echo "========================================="
+    echo "🔄 Attempt $RETRY_COUNT/$MAX_RETRIES: $METHOD"
+    echo "========================================="
+    
+    case "$METHOD" in
+        "yt-dlp_normal")
+            yt-dlp \
+                --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+                --format "$QUALITY" \
+                --merge-output-format mp4 \
+                --retries 10 \
+                --fragment-retries 20 \
+                --no-check-certificate \
+                --geo-bypass \
+                --geo-bypass-country US \
+                --socket-timeout 30 \
+                "$URL" && SUCCESS=true
+            ;;
+            
+        "yt-dlp_with_headers")
+            yt-dlp \
+                --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+                --format "$QUALITY" \
+                --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+                --add-header "Accept-Language:en-US,en;q=0.5" \
+                --add-header "Referer:https://www.google.com/" \
+                --merge-output-format mp4 \
+                --retries 10 \
+                --no-check-certificate \
+                "$URL" && SUCCESS=true
+            ;;
+            
+        "yt-dlp_with_user_agent")
+            yt-dlp \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0" \
+                --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+                --format "$QUALITY" \
+                --merge-output-format mp4 \
+                --retries 10 \
+                --no-check-certificate \
+                "$URL" && SUCCESS=true
+            ;;
+            
+        "yt-dlp_with_proxy")
+            yt-dlp \
+                --proxy "http://us.proxy.webshare.io:80" \
+                --output "$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+                --format "$QUALITY" \
+                --merge-output-format mp4 \
+                --retries 15 \
+                --no-check-certificate \
+                "$URL" && SUCCESS=true
+            ;;
+            
+        "curl_fallback")
+            FILENAME=$(echo "$URL" | md5sum | cut -d' ' -f1).mp4
+            curl -L \
+                -H "User-Agent: Mozilla/5.0" \
+                -H "Accept: */*" \
+                --max-time 300 \
+                --retry 5 \
+                -o "$FOLDER/$FILENAME" \
+                "$URL" && [ -s "$FOLDER/$FILENAME" ] && SUCCESS=true
+            ;;
+    esac
+    
+    if [ "$SUCCESS" = true ]; then
+        echo "✅ Download successful with method: $METHOD"
+        break
+    else
+        echo "❌ Method $METHOD failed, trying next..."
+        sleep 3
+    fi
+done
+
+if [ "$SUCCESS" = false ]; then
+    echo "❌ ALL DOWNLOAD METHODS FAILED"
+    exit 1
+fi
+
+# پیدا کردن فایل دانلود شده
+sleep 2
+DOWNLOADED_FILE=$(find "$FOLDER" -type f -newer "$FOLDER/.download_start" ! -name ".download_start" | head -1)
+
+if [ -n "$DOWNLOADED_FILE" ]; then
+    FILE_SIZE=$(stat -c%s "$DOWNLOADED_FILE")
+    echo "✅ Download completed: $DOWNLOADED_FILE ($(echo "scale=2; $FILE_SIZE/1048576" | bc) MB)"
+    echo "downloaded_file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+fi
+EOF
           chmod +x scripts/download_with_retry.sh
           
-          # آماده‌سازی متغیرها
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          if [ "${{ inputs.adult_content }}" = "true" ]; then
-            FOLDER="adult_${FOLDER}"
-            echo "⚠️ Adult content mode enabled"
-          fi
+      - name: 📝 Create smart_split.sh script
+        run: |
+          cat > scripts/smart_split.sh << 'EOF'
+#!/bin/bash
+
+FILE_PATH="$1"
+MAX_SIZE_MB="$2"
+
+if [ -z "$FILE_PATH" ] || [ ! -f "$FILE_PATH" ]; then
+    exit 1
+fi
+
+if [ -z "$MAX_SIZE_MB" ]; then
+    MAX_SIZE_MB=95
+fi
+
+FOLDER=$(dirname "$FILE_PATH")
+FILENAME=$(basename "$FILE_PATH")
+BASENAME="${FILENAME%.*}"
+
+cd "$FOLDER"
+
+FILE_SIZE_BYTES=$(stat -c%s "$FILENAME")
+FILE_SIZE_MB=$(echo "scale=2; $FILE_SIZE_BYTES/1048576" | bc)
+
+if (( $(echo "$FILE_SIZE_MB > $MAX_SIZE_MB" | bc -l) )); then
+    echo "Splitting $FILENAME (${FILE_SIZE_MB}MB) into ${MAX_SIZE_MB}MB parts..."
+    
+    RANDOM_HEX=$(openssl rand -hex 4)
+    ARCHIVE_NAME="part_${RANDOM_HEX}"
+    
+    rar a -v${MAX_SIZE_MB}m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+    
+    if [ $? -eq 0 ]; then
+        rm "$FILENAME"
+        echo "✅ Split completed"
+    fi
+fi
+EOF
+          chmod +x scripts/smart_split.sh
           
-          mkdir -p "$FOLDER"
+      - name: 🔍 Check URL status
+        id: check_url
+        run: |
+          ./scripts/check_url.sh "${{ github.event.inputs.url }}" || true
           
+      - name: 📥 Download file
+        id: download
+        run: |
           export DOWNLOAD_URL="${{ github.event.inputs.url }}"
-          export OUTPUT_FOLDER="$FOLDER"
+          export OUTPUT_FOLDER="${{ github.event.inputs.output_folder }}"
           export QUALITY="${{ github.event.inputs.quality }}"
           export USE_PROXY="${{ inputs.use_proxy }}"
           
+          if [ "${{ inputs.adult_content }}" = "true" ]; then
+            export OUTPUT_FOLDER="adult_${{ github.event.inputs.output_folder }}"
+            echo "⚠️ Adult content mode enabled"
+          fi
+          
           ./scripts/download_with_retry.sh
           
-          # ذخیره اطلاعات فایل دانلود شده
-          LATEST_FILE=$(find "$FOLDER" -type f -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" | head -1)
+          # پیدا کردن فایل دانلود شده
+          if [ "${{ inputs.adult_content }}" = "true" ]; then
+            FOLDER="adult_${{ github.event.inputs.output_folder }}"
+          else
+            FOLDER="${{ github.event.inputs.output_folder }}"
+          fi
+          
+          LATEST_FILE=$(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" \) 2>/dev/null | head -1)
           if [ -n "$LATEST_FILE" ]; then
             echo "downloaded_file=$LATEST_FILE" >> $GITHUB_OUTPUT
-            FILE_SIZE=$(stat -c%s "$LATEST_FILE")
-            echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
+            echo "file_path=$LATEST_FILE" >> $GITHUB_OUTPUT
           fi
-        env:
-          HTTP_PROXY: ${{ env.PROXY }}
-          HTTPS_PROXY: ${{ env.PROXY }}
           
-      - name: ✂️ Smart split if needed
+      - name: ✂️ Split large files
         if: steps.download.outputs.downloaded_file != ''
         run: |
-          chmod +x scripts/smart_split.sh
-          FILE_SIZE_MB=$(echo "scale=2; ${{ steps.download.outputs.file_size }} / 1048576" | bc)
-          THRESHOLD_MB=${{ inputs.max_size_mb }}
+          ./scripts/smart_split.sh "${{ steps.download.outputs.downloaded_file }}" ${{ inputs.max_size_mb }}
           
-          if (( $(echo "$FILE_SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-            echo "File size ($FILE_SIZE_MB MB) exceeds threshold ($THRESHOLD_MB MB). Splitting..."
-            ./scripts/smart_split.sh "${{ steps.download.outputs.downloaded_file }}" $THRESHOLD_MB
-          else
-            echo "File size ($FILE_SIZE_MB MB) is OK. No split needed."
-          fi
-          
-      - name: 🔒 Protect adult content
-        if: inputs.adult_content == true
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          ADULT_FOLDER="adult_${FOLDER}"
-          
-          if [ -d "$ADULT_FOLDER" ]; then
-            # ایجاد فایل .gitkeep و .adult-protect برای علامت‌گذاری
-            echo "This folder contains adult content - Access restricted" > "$ADULT_FOLDER/.adult-protect"
-            echo "*.rar filter=git-crypt" > "$ADULT_FOLDER/.gitattributes"
-            
-            # تغییر permission در git
-            git update-index --skip-worktree "$ADULT_FOLDER/.adult-protect" 2>/dev/null || true
-          fi
-          
-      - name: 💾 Commit and push to repository
+      - name: 💾 Commit and push
         run: |
           git config user.name "KMA Downloader Bot"
           git config user.email "kma-downloader@github.com"
           
-          # فقط فایل‌های جدید رو اضافه کن
           git add -A
           
-          # اگه تغییری بود کامیت کن
           if ! git diff --cached --quiet; then
-            git commit -m "📥 Downloaded: ${{ github.event.inputs.url }}" -m "Quality: ${{ github.event.inputs.quality }}" -m "Time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-            git push origin HEAD:main --force
-            echo "✅ Changes committed and pushed"
+            git commit -m "📥 Downloaded from: ${{ github.event.inputs.url }}" || true
+            git push || true
+            echo "✅ Changes committed"
           else
             echo "ℹ️ No new files to commit"
           fi
           
       - name: 📊 Summary
+        if: always()
         run: |
           echo "## 🚀 Download Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **URL:** ${{ github.event.inputs.url }}" >> $GITHUB_STEP_SUMMARY
@@ -175,7 +360,6 @@ jobs:
           echo "- **Proxy Used:** ${{ inputs.use_proxy }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Status:** ✅ Completed" >> $GITHUB_STEP_SUMMARY
           
-          if [ -n "${{ steps.download.outputs.file_size }}" ]; then
-            SIZE_MB=$(echo "scale=2; ${{ steps.download.outputs.file_size }} / 1048576" | bc)
-            echo "- **File Size:** ${SIZE_MB} MB" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ steps.download.outputs.downloaded_file }}" ]; then
+            echo "- **Saved to:** ${{ steps.download.outputs.downloaded_file }}" >> $GITHUB_STEP_SUMMARY
           fi
