@@ -13,10 +13,15 @@ on:
         type: string
         default: 'downloads'
       quality:
-        description: 'Video quality'
+        description: 'Video quality (yt-dlp format selector)'
         required: true
         type: string
-        default: 'best[ext=mp4]/best'
+        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
+      archive_name:
+        description: 'Base name for the RAR archive (if file is split)'
+        required: false
+        type: string
+        default: 'video'
 
 permissions:
   contents: write
@@ -35,26 +40,16 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
 
-      - name: Install yt-dlp with cookies support
+      - name: Install yt-dlp and bc
         run: |
           pip install -U yt-dlp
           sudo apt-get update
           sudo apt-get install -y bc rar
 
-      - name: Create realistic browser cookies
-        run: |
-          # ساخت کوکی شبیه مرورگر واقعی
-          cat > cookies.txt << 'EOF'
-# Netscape HTTP Cookie File
-.youtube.com	TRUE	/	FALSE	1735689600	CONSENT	YES+cb
-.google.com	TRUE	/	FALSE	1735689600	CONSENT	YES+cb
-EOF
-
-      - name: Download video with anti-blocking measures
+      - name: Download video
         id: download
-        shell: bash
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
           mkdir -p "$FOLDER"
@@ -62,114 +57,38 @@ EOF
 
           URL="${{ github.event.inputs.url }}"
           
-          # لیست User-Agent های واقعی
-          USER_AGENTS=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-          )
-          
-          RANDOM_UA=${USER_AGENTS[$RANDOM % ${#USER_AGENTS[@]}]}
-          
-          echo "Using User-Agent: $RANDOM_UA"
-          
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          SUCCESS=false
+          # دانلود با هدرهای کامل برای دور زدن 410
+          yt-dlp \
+            --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+            --format "${{ github.event.inputs.quality }}" \
+            --merge-output-format mp4 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+            --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+            --add-header "Accept-Language:en-US,en;q=0.9" \
+            --add-header "Referer:https://www.google.com/" \
+            --retries 10 \
+            --fragment-retries 10 \
+            --no-check-certificate \
+            --geo-bypass \
+            --sleep-interval 2 \
+            "$URL" || {
+              echo "First attempt failed, trying with proxy..."
+              yt-dlp \
+                --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+                --format "${{ github.event.inputs.quality }}" \
+                --merge-output-format mp4 \
+                --proxy "socks5://184.178.172.5:4145" \
+                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                --retries 10 \
+                --no-check-certificate \
+                "$URL"
+            }
 
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; do
-            echo "Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
-            
-            # روش اول: با هدرهای کامل مرورگر
-            yt-dlp \
-              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-              --format "${{ github.event.inputs.quality }}" \
-              --merge-output-format mp4 \
-              --user-agent "$RANDOM_UA" \
-              --add-header "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
-              --add-header "Accept-Language: en-US,en;q=0.9" \
-              --add-header "Accept-Encoding: gzip, deflate, br" \
-              --add-header "DNT: 1" \
-              --add-header "Connection: keep-alive" \
-              --add-header "Upgrade-Insecure-Requests: 1" \
-              --add-header "Sec-Fetch-Dest: document" \
-              --add-header "Sec-Fetch-Mode: navigate" \
-              --add-header "Sec-Fetch-Site: none" \
-              --add-header "Sec-Fetch-User: ?1" \
-              --add-header "Cache-Control: max-age=0" \
-              --cookies cookies.txt \
-              --sleep-interval 3 \
-              --max-sleep-interval 8 \
-              --retries 5 \
-              --fragment-retries 10 \
-              --no-check-certificate \
-              --geo-bypass \
-              --geo-bypass-country US \
-              --no-color \
-              "$URL" && {
-                
-                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit 2>/dev/null)
-                
-                if [ -n "$NEW_FILE" ]; then
-                  echo "Download succeeded: $NEW_FILE"
-                  SUCCESS=true
-                  break
-                fi
-              }
-            
-            RETRY_COUNT=$((RETRY_COUNT+1))
-            
-            if [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$SUCCESS" = false ]; then
-              echo "Retrying with different approach..."
-              sleep 10
-              
-              # روش دوم: با پروکسی (اگر روش اول جواب نداد)
-              if [ $RETRY_COUNT -eq 2 ]; then
-                echo "Trying with proxy..."
-                yt-dlp \
-                  --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-                  --format "${{ github.event.inputs.quality }}" \
-                  --merge-output-format mp4 \
-                  --proxy "socks5://184.178.172.5:4145" \
-                  --user-agent "$RANDOM_UA" \
-                  --add-header "Accept-Language: en-US,en;q=0.9" \
-                  --retries 5 \
-                  --no-check-certificate \
-                  --geo-bypass \
-                  "$URL" && {
-                    NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit 2>/dev/null)
-                    if [ -n "$NEW_FILE" ]; then
-                      echo "Download succeeded with proxy: $NEW_FILE"
-                      SUCCESS=true
-                      break
-                    fi
-                  }
-              fi
-            fi
-          done
-
-          if [ "$SUCCESS" = false ]; then
-            echo "All download attempts failed"
-            echo "Trying one last method: curl with cookies"
-            
-            # روش آخر: دانلود مستقیم با curl
-            curl -L -b cookies.txt -c cookies.txt \
-              -H "User-Agent: $RANDOM_UA" \
-              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
-              -H "Accept-Language: en-US,en;q=0.9" \
-              --max-time 300 \
-              --retry 3 \
-              -o "$FOLDER/video.mp4" \
-              "$URL"
-            
-            if [ -f "$FOLDER/video.mp4" ] && [ -s "$FOLDER/video.mp4" ]; then
-              NEW_FILE="$FOLDER/video.mp4"
-              SUCCESS=true
-              echo "Download succeeded with curl"
-            else
-              exit 1
-            fi
+          NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit | head -1)
+          
+          if [ -z "$NEW_FILE" ]; then
+            echo "No file was downloaded"
+            exit 1
           fi
 
           FILENAME=$(basename "$NEW_FILE")
@@ -177,33 +96,30 @@ EOF
 
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
+          echo "filepath=$NEW_FILE" >> $GITHUB_OUTPUT
 
-      - name: Conditional split (if file > 99 MB)
-        id: split
-        shell: bash
+      - name: Split if needed
         run: |
-          if [ -n "${{ steps.download.outputs.filename }}" ]; then
+          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
+          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
+          THRESHOLD_MB=99
+          
+          COMPARE=$(echo "$SIZE_MB > $THRESHOLD_MB" | bc)
+          
+          if [ "$COMPARE" -eq 1 ]; then
             FOLDER="${{ github.event.inputs.output_folder }}"
             FILENAME="${{ steps.download.outputs.filename }}"
-            SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-            SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-            THRESHOLD_MB=99
-
             cd "$FOLDER"
-
-            if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-              RANDOM_HEX=$(openssl rand -hex 3)
-              ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
-              rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
-              rm "$FILENAME"
-              echo "split_done=true" >> $GITHUB_OUTPUT
-            else
-              echo "split_done=false" >> $GITHUB_OUTPUT
-            fi
+            RANDOM_HEX=$(openssl rand -hex 3)
+            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
+            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
+            rm "$FILENAME"
+            echo "File was split into parts"
+          else
+            echo "File size ($SIZE_MB MB) is under threshold, no split needed"
           fi
 
-      - name: Commit and push to repository
-        shell: bash
+      - name: Commit and push
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
           git config user.name "github-actions[bot]"
