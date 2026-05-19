@@ -62,14 +62,17 @@ jobs:
 
       - name: Prepare folder
         run: |
-          if [ "${{ github.event.inputs.adult_content }}" = "true" ]; then
-            FOLDER="adult_${{ github.event.inputs.output_folder }}"
+          if [ "$ADULT_CONTENT" = "true" ]; then
+            FOLDER="adult_$OUTPUT_FOLDER"
           else
-            FOLDER="${{ github.event.inputs.output_folder }}"
+            FOLDER="$OUTPUT_FOLDER"
           fi
           mkdir -p "$FOLDER"
           echo "FOLDER=$FOLDER" >> $GITHUB_ENV
-          touch marker.txt
+          date > timestamp.txt
+        env:
+          OUTPUT_FOLDER: ${{ github.event.inputs.output_folder }}
+          ADULT_CONTENT: ${{ github.event.inputs.adult_content }}
 
       - name: Download video
         id: download
@@ -81,7 +84,9 @@ jobs:
           echo "Downloading from: $URL"
           echo "Saving to: $FOLDER"
           
-          # تلاش با روش‌های مختلف
+          DOWNLOAD_SUCCESS=false
+          
+          # روش اول: دانلود معمولی
           if yt-dlp \
             --output "$FOLDER/%(title)s.%(ext)s" \
             --format "$QUALITY" \
@@ -91,46 +96,85 @@ jobs:
             --geo-bypass \
             --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             "$URL"; then
-            echo "Download successful"
-          else
-            # تلاش دوم با پروکسی
-            if [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
-              yt-dlp \
-                --output "$FOLDER/%(title)s.%(ext)s" \
-                --format "$QUALITY" \
-                --merge-output-format mp4 \
-                --retries 10 \
-                --proxy "http://us.proxy.webshare.io:80" \
-                --user-agent "Mozilla/5.0" \
-                "$URL"
-            else
-              exit 1
+            DOWNLOAD_SUCCESS=true
+            echo "Download successful with normal method"
+          fi
+          
+          # روش دوم: با پروکسی
+          if [ "$DOWNLOAD_SUCCESS" = "false" ] && [ "${{ github.event.inputs.use_proxy }}" = "true" ]; then
+            echo "Trying with proxy..."
+            if yt-dlp \
+              --output "$FOLDER/%(title)s.%(ext)s" \
+              --format "$QUALITY" \
+              --merge-output-format mp4 \
+              --retries 10 \
+              --proxy "http://us.proxy.webshare.io:80" \
+              --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" \
+              --no-check-certificate \
+              "$URL"; then
+              DOWNLOAD_SUCCESS=true
+              echo "Download successful with proxy"
             fi
           fi
           
+          # روش سوم: با هدرهای بیشتر
+          if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
+            echo "Trying with additional headers..."
+            if yt-dlp \
+              --output "$FOLDER/%(title)s.%(ext)s" \
+              --format "$QUALITY" \
+              --merge-output-format mp4 \
+              --retries 10 \
+              --add-header "User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" \
+              --add-header "Accept-Language:en-US,en;q=0.5" \
+              --add-header "Referer:https://www.google.com/" \
+              --no-check-certificate \
+              "$URL"; then
+              DOWNLOAD_SUCCESS=true
+              echo "Download successful with headers"
+            fi
+          fi
+          
+          if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
+            echo "All download methods failed!"
+            exit 1
+          fi
+          
           # پیدا کردن فایل دانلود شده
-          DOWNLOADED_FILE=$(find "$FOLDER" -type f -newer marker.txt 2>/dev/null | head -1)
+          sleep 2
+          DOWNLOADED_FILE=$(find "$FOLDER" -type f -newer timestamp.txt ! -name "timestamp.txt" 2>/dev/null | head -1)
+          
           if [ -n "$DOWNLOADED_FILE" ]; then
             echo "file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
-            SIZE=$(stat -c%s "$DOWNLOADED_FILE")
+            SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || stat -f%z "$DOWNLOADED_FILE" 2>/dev/null)
             echo "size=$SIZE" >> $GITHUB_OUTPUT
             echo "✅ Downloaded: $DOWNLOADED_FILE"
+          else
+            echo "Warning: Could not find downloaded file, but continuing..."
           fi
 
       - name: Split if needed
         if: steps.download.outputs.file != ''
         run: |
           FILE="${{ steps.download.outputs.file }}"
-          SIZE_MB=$(echo "scale=2; ${{ steps.download.outputs.size }} / 1048576" | bc)
-          THRESHOLD=${{ github.event.inputs.max_size_mb }}
+          SIZE="${{ steps.download.outputs.size }}"
+          THRESHOLD="${{ github.event.inputs.max_size_mb }}"
           
-          if (( $(echo "$SIZE_MB > $THRESHOLD" | bc -l) )); then
-            echo "File is ${SIZE_MB}MB, splitting into ${THRESHOLD}MB parts..."
-            cd "$(dirname "$FILE")"
-            RAND_NAME=$(openssl rand -hex 3)
-            rar a -v${THRESHOLD}m -m5 "${RAND_NAME}.rar" "$(basename "$FILE")"
-            rm "$(basename "$FILE")"
-            echo "✅ Split complete"
+          if [ -n "$SIZE" ] && [ -n "$THRESHOLD" ]; then
+            SIZE_MB=$(echo "$SIZE / 1048576" | bc)
+            
+            if [ "$SIZE_MB" -gt "$THRESHOLD" ]; then
+              echo "File is ${SIZE_MB}MB, splitting into ${THRESHOLD}MB parts..."
+              cd "$(dirname "$FILE")"
+              BASENAME=$(basename "$FILE")
+              RAND_NAME=$(openssl rand -hex 3)
+              rar a -v${THRESHOLD}m -m5 "${RAND_NAME}.rar" "$BASENAME"
+              rm "$BASENAME"
+              echo "✅ Split complete"
+            else
+              echo "File size ${SIZE_MB}MB is under threshold ${THRESHOLD}MB, no split needed"
+            fi
           fi
 
       - name: Commit and push
