@@ -1,0 +1,34 @@
+# Downloads
+downloads/
+adult_*/
+*.mp4
+*.mkv
+*.webm
+*.rar
+*.part*
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+*.log
+*.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets
+cookies.txt
+*.key
+*.pem
+.env
+
+# Large files
+*.zip
+*.7z
+*.tar.gz
