@@ -13,12 +13,12 @@ on:
         type: string
         default: 'downloads'
       quality:
-        description: 'Video quality (yt-dlp format selector)'
+        description: 'Video quality'
         required: true
         type: string
-        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
+        default: 'best[ext=mp4]/best'
       archive_name:
-        description: 'Base name for the RAR archive (if file is split)'
+        description: 'Base name for the RAR archive'
         required: false
         type: string
         default: 'video'
@@ -26,12 +26,10 @@ on:
 permissions:
   contents: write
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
-  download-and-maybe-split:
+  download:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -40,90 +38,100 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
-      - name: Install yt-dlp and bc
+      - name: Install latest yt-dlp
         run: |
           pip install -U yt-dlp
           sudo apt-get update
-          sudo apt-get install -y bc rar
+          sudo apt-get install -y rar
 
-      - name: Download video
+      - name: Download with advanced bypass
         id: download
         run: |
           FOLDER="${{ github.event.inputs.output_folder }}"
           mkdir -p "$FOLDER"
-          touch marker
-
+          
           URL="${{ github.event.inputs.url }}"
           
-          # دانلود با هدرهای کامل برای دور زدن 410
+          echo "=== DOWNLOADING: $URL ==="
+          
+          # روش اول: با extractor-args مخصوص
           yt-dlp \
-            --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+            --output "$FOLDER/%(title)s.%(ext)s" \
             --format "${{ github.event.inputs.quality }}" \
             --merge-output-format mp4 \
-            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            --add-header "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
-            --add-header "Accept-Language:en-US,en;q=0.9" \
-            --add-header "Referer:https://www.google.com/" \
-            --retries 10 \
-            --fragment-retries 10 \
+            --extractor-args "generic:no-playlist,generic:no-live" \
+            --extractor-args "youtube:skip=webpage" \
+            --user-agent "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15" \
+            --add-header "Accept: */*" \
+            --add-header "Accept-Language: en-US,en;q=0.9" \
+            --add-header "Sec-Fetch-Site: cross-site" \
+            --add-header "Sec-Fetch-Mode: navigate" \
             --no-check-certificate \
             --geo-bypass \
-            --sleep-interval 2 \
-            "$URL" || {
-              echo "First attempt failed, trying with proxy..."
-              yt-dlp \
-                --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-                --format "${{ github.event.inputs.quality }}" \
-                --merge-output-format mp4 \
-                --proxy "socks5://184.178.172.5:4145" \
-                --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                --retries 10 \
-                --no-check-certificate \
-                "$URL"
-            }
-
-          NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit | head -1)
+            --geo-bypass-country US \
+            --no-warnings \
+            --verbose \
+            "$URL" 2>&1 | tee download.log
           
-          if [ -z "$NEW_FILE" ]; then
-            echo "No file was downloaded"
+          # پیدا کردن فایل دانلود شده
+          sleep 2
+          DOWNLOADED_FILE=$(find "$FOLDER" -type f \( -name "*.mp4" -o -name "*.mkv" -o -name "*.webm" -o -name "*.ts" \) | head -1)
+          
+          if [ -z "$DOWNLOADED_FILE" ]; then
+            # روش دوم: استفاده از curl با کوکی و رفرش
+            echo "Trying alternative method with curl..."
+            
+            # اول HTML صفحه رو بگیر
+            curl -L -c cookies.txt -b cookies.txt \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -H "Accept: text/html,application/xhtml+xml" \
+              --max-time 30 \
+              -o page.html \
+              "$URL"
+            
+            # استخراج لینک‌های ویدیویی از صفحه
+            grep -Eo 'https?://[^"]+\.(mp4|m3u8|ts|mkv)' page.html | head -1 > video_url.txt
+            
+            if [ -s video_url.txt ]; then
+              VIDEO_URL=$(cat video_url.txt)
+              echo "Found video URL: $VIDEO_URL"
+              curl -L -b cookies.txt -o "$FOLDER/video.mp4" "$VIDEO_URL"
+              DOWNLOADED_FILE="$FOLDER/video.mp4"
+            fi
+          fi
+          
+          if [ -z "$DOWNLOADED_FILE" ] || [ ! -f "$DOWNLOADED_FILE" ]; then
+            echo "ERROR: Download failed completely"
+            cat download.log
             exit 1
           fi
+          
+          SIZE=$(stat -c%s "$DOWNLOADED_FILE" 2>/dev/null || stat -f%z "$DOWNLOADED_FILE" 2>/dev/null)
+          echo "file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
+          echo "size=$SIZE" >> $GITHUB_OUTPUT
+          echo "✅ Downloaded: $DOWNLOADED_FILE ($(($SIZE/1048576)) MB)"
 
-          FILENAME=$(basename "$NEW_FILE")
-          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
-
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
-          echo "filepath=$NEW_FILE" >> $GITHUB_OUTPUT
-
-      - name: Split if needed
+      - name: Split large file
+        if: steps.download.outputs.file != ''
         run: |
-          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
+          FILE="${{ steps.download.outputs.file }}"
+          SIZE="${{ steps.download.outputs.size }}"
+          SIZE_MB=$((SIZE / 1048576))
           
-          COMPARE=$(echo "$SIZE_MB > $THRESHOLD_MB" | bc)
-          
-          if [ "$COMPARE" -eq 1 ]; then
-            FOLDER="${{ github.event.inputs.output_folder }}"
-            FILENAME="${{ steps.download.outputs.filename }}"
-            cd "$FOLDER"
+          if [ $SIZE_MB -gt 99 ]; then
+            cd "$(dirname "$FILE")"
             RANDOM_HEX=$(openssl rand -hex 3)
-            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
-            rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"
-            rm "$FILENAME"
-            echo "File was split into parts"
-          else
-            echo "File size ($SIZE_MB MB) is under threshold, no split needed"
+            rar a -v95m -m5 "${RANDOM_HEX}.rar" "$(basename "$FILE")"
+            rm "$(basename "$FILE")"
+            echo "✅ File split into parts"
           fi
 
       - name: Commit and push
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$FOLDER/"
-          git commit -m "Add downloaded video(s)" || echo "Nothing to commit"
+          git config user.email "actions@github.com"
+          git add .
+          git commit -m "Add downloaded content" || echo "No changes"
           git push
