@@ -8,6 +8,18 @@ on:
         required: true
         type: string
 
+      quality:
+        description: "Quality"
+        required: true
+        default: "720"
+        type: choice
+        options:
+          - "360"
+          - "480"
+          - "720"
+          - "1080"
+          - "best"
+
 permissions:
   contents: write
 
@@ -24,72 +36,87 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install packages
         run: |
           python -m pip install --upgrade pip
-          pip install -U yt-dlp
-          sudo apt-get update
-          sudo apt-get install -y rar curl gnupg lsb-release
-
-      - name: Install Cloudflare WARP
-        run: |
-          curl https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ focal main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+          pip install -U --pre yt-dlp
 
           sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
+          sudo apt-get install -y tor ffmpeg rar
 
-      - name: Connect WARP
+      - name: Start Tor
         run: |
-          sudo warp-cli --accept-tos registration new
-          sudo warp-cli --accept-tos mode proxy
-          sudo warp-cli --accept-tos connect
+          sudo systemctl start tor
+          sleep 10
 
-          sleep 15
-
-      - name: Check IP
+      - name: Check Tor
         run: |
-          curl --proxy socks5://127.0.0.1:40000 https://ifconfig.me
+          curl --socks5-hostname 127.0.0.1:9050 https://check.torproject.org/api/ip -s
 
       - name: Create folders
         run: |
           mkdir -p downloads
           mkdir -p split
+          touch timestamp.txt
 
-      - name: Download video
+      - name: Set quality format
+        id: quality
+        shell: bash
+        run: |
+          QUALITY="${{ github.event.inputs.quality }}"
+
+          if [ "$QUALITY" = "best" ]; then
+            FORMAT="best[ext=mp4]/best"
+          else
+            FORMAT="best[height<=${QUALITY}][ext=mp4]/best[height<=${QUALITY}]"
+          fi
+
+          echo "format=$FORMAT" >> $GITHUB_OUTPUT
+
+          echo "Using format:"
+          echo "$FORMAT"
+
+      - name: Download via Tor
         id: download
         shell: bash
         run: |
+          FOLDER="downloads"
+          URL="${{ github.event.inputs.url }}"
+
+          echo "Downloading via Tor from: $URL"
+
           yt-dlp \
-            --proxy socks5://127.0.0.1:40000 \
-            --extractor-args "pornhub:client=android" \
-            --add-header "Referer:https://www.pornhub.com/" \
-            --add-header "Origin:https://www.pornhub.com" \
-            --user-agent "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 Chrome/124.0.0.0 Mobile Safari/537.36" \
-            --force-ipv4 \
-            --no-check-certificates \
+            --proxy "socks5://127.0.0.1:9050" \
+            --output "$FOLDER/%(title)s.%(ext)s" \
+            --format "${{ steps.quality.outputs.format }}" \
+            --merge-output-format mp4 \
             --retries 20 \
             --fragment-retries 20 \
+            --concurrent-fragments 4 \
             --socket-timeout 30 \
-            -f "best[height<=720]" \
-            --merge-output-format mp4 \
-            -o "downloads/%(title)s.%(ext)s" \
-            "${{ github.event.inputs.url }}"
+            --no-check-certificate \
+            --force-ipv4 \
+            --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            --add-header "Accept-Language: en-US,en;q=0.9" \
+            "$URL"
 
-          FILE=$(find downloads -type f | head -n 1)
+          DOWNLOADED_FILE=$(find "$FOLDER" -type f -newer timestamp.txt ! -name "timestamp.txt" | head -1)
 
-          if [ ! -f "$FILE" ]; then
+          if [ -z "$DOWNLOADED_FILE" ]; then
             echo "Download failed"
             exit 1
           fi
 
-          echo "file=$FILE" >> $GITHUB_OUTPUT
+          echo "file=$DOWNLOADED_FILE" >> $GITHUB_OUTPUT
 
-      - name: Split if bigger than 95MB
+          echo "Downloaded:"
+          echo "$DOWNLOADED_FILE"
+
+      - name: Split large files
         shell: bash
         run: |
           FILE="${{ steps.download.outputs.file }}"
+
           SIZE=$(stat -c%s "$FILE")
 
           LIMIT=$((95 * 1024 * 1024))
@@ -108,12 +135,12 @@ jobs:
 
           fi
 
-      - name: Generate tag
+      - name: Generate release tag
         id: tag
         run: |
           echo "tag=release-$(date +%s)" >> $GITHUB_OUTPUT
 
-      - name: Create Release
+      - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
